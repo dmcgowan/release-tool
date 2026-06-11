@@ -45,6 +45,10 @@ const (
 
 var (
 	errUnknownFormat = errors.New("unknown file format")
+	// errLookupFailed is returned by getSha when every git ls-remote attempt
+	// errored out (e.g. network not available, repository unreachable). It is
+	// distinct from a successful lookup that simply found no matching refs.
+	errLookupFailed = errors.New("git ls-remote lookup failed")
 )
 
 func loadRelease(path string) (*release, error) {
@@ -406,22 +410,32 @@ func nextGitURLTry(url string) string {
 	return prefix + strings.Join(parts[:len(parts)-1], "/")
 }
 
-func lsRemote(key, gitURL, rev string) []byte {
+// lsRemote runs `git ls-remote gitURL rev rev^{}` and returns the raw output.
+// It walks up parent URL segments to handle Go submodule paths. The returned
+// bool is true if at least one ls-remote invocation exited without error
+// (regardless of whether any refs matched); false means every attempt failed
+// (e.g. network unreachable, unknown repository).
+func lsRemote(key, gitURL, rev string) ([]byte, bool) {
 	for gitURL != "" {
 		b, err := git("ls-remote", gitURL, rev, rev+"^{}")
 		if err != nil {
-			// strip next ending to handle Go submodules
+			// strip next path segment to handle Go submodules
 			gitURL = nextGitURLTry(gitURL)
 			if !strings.Contains(err.Error(), "not found") {
 				logrus.WithError(err).WithField("key", key).Debug("not using sha")
 			}
-		} else {
-			return b
+			continue
 		}
-
+		if len(b) > 0 {
+			// ls-remote succeeded and returned matching refs — done.
+			return b, true
+		}
+		// ls-remote succeeded but returned no matching refs for this URL.
+		// Try the parent URL in case we need to strip a submodule suffix.
+		gitURL = nextGitURLTry(gitURL)
 	}
-	return nil
-
+	// All URL tries errored out — distinguish from "found but empty".
+	return nil, false
 }
 
 func getSha(gitURL, rev string, cache Cache) (string, error) {
@@ -432,9 +446,15 @@ func getSha(gitURL, rev string, cache Cache) (string, error) {
 	}
 	logrus.WithField("cache", "miss").Debug(key)
 
-	b := lsRemote(key, gitURL, rev)
-	if b == nil {
-		// Not found, don't use sha
+	b, ok := lsRemote(key, gitURL, rev)
+	if !ok {
+		// Every ls-remote attempt errored (network failure, unreachable repo,
+		// etc.). Return a distinct error so callers can fall back gracefully.
+		return "", errLookupFailed
+	}
+	if len(b) == 0 {
+		// ls-remote succeeded but found no matching refs for the given rev.
+		// This is a valid outcome (e.g. a Go-only pseudo-version with no tag).
 		return "", nil
 	}
 
@@ -563,44 +583,71 @@ func getUpdatedDeps(previous, deps []dependency, ignored []string, cache Cache) 
 				updated = append(updated, c)
 			}
 		} else if d.Ref != c.Ref {
+			// Refs differ — attempt best-effort SHA resolution to catch cases
+			// where two different-looking refs point to the same commit (e.g. a
+			// semver tag and its pseudo-version equivalent).  Lookup failures
+			// (network unreachable, unknown repository) are non-fatal: we fall
+			// back to trusting the Ref difference so that genuine version bumps
+			// are never silently dropped.
 			if d.Sha == "" {
 				if d.GitURL == "" {
 					gitURL, err := resolveGitURL(name, cache)
 					if err != nil {
-						return nil, fmt.Errorf("git url for %s: %w", name, err)
-					}
-					d.GitURL = gitURL
-					if c.GitURL == "" {
-						c.GitURL = d.GitURL
+						logrus.WithError(err).Warnf("git url lookup failed for %s; falling back to Ref comparison", name)
+					} else {
+						d.GitURL = gitURL
+						if c.GitURL == "" {
+							c.GitURL = gitURL
+						}
 					}
 				}
-				sha, err := getSha(d.GitURL, d.Ref, cache)
-				if err != nil {
-					return nil, fmt.Errorf("failed to get sha for %s: %w", name, err)
+				if d.GitURL != "" {
+					sha, err := getSha(d.GitURL, d.Ref, cache)
+					if err != nil && !errors.Is(err, errLookupFailed) {
+						return nil, fmt.Errorf("failed to get sha for %s: %w", name, err)
+					}
+					if err != nil {
+						logrus.WithError(err).Warnf("sha lookup failed for %s@%s; falling back to Ref comparison", name, d.Ref)
+					}
+					d.Sha = sha
 				}
-				d.Sha = sha
 			}
 			if c.Sha == "" {
 				if c.GitURL == "" {
 					gitURL, err := resolveGitURL(name, cache)
 					if err != nil {
-						return nil, fmt.Errorf("git url for %s: %w", name, err)
+						logrus.WithError(err).Warnf("git url lookup failed for %s; falling back to Ref comparison", name)
+					} else {
+						c.GitURL = gitURL
 					}
-					c.GitURL = gitURL
 				}
-				sha, err := getSha(c.GitURL, c.Ref, cache)
-				if err != nil {
-					return nil, fmt.Errorf("failed to get sha for %s: %w", name, err)
+				if c.GitURL != "" {
+					sha, err := getSha(c.GitURL, c.Ref, cache)
+					if err != nil && !errors.Is(err, errLookupFailed) {
+						return nil, fmt.Errorf("failed to get sha for %s: %w", name, err)
+					}
+					if err != nil {
+						logrus.WithError(err).Warnf("sha lookup failed for %s@%s; falling back to Ref comparison", name, c.Ref)
+					}
+					c.Sha = sha
 				}
-				c.Sha = sha
 			}
 
-			if d.Sha != c.Sha {
-				logrus.Debugf("Updated dependency: %q %s(%s) -> %s(%s)", d.Name, d.Ref, d.Sha, c.Ref, c.Sha)
-				// set the previous commit
-				c.Previous = d.Ref
-				updated = append(updated, c)
+			// Only suppress the change if BOTH SHAs resolved successfully and
+			// are identical — meaning the two different Refs are aliases for the
+			// same underlying commit.  When either SHA is empty (lookup failed,
+			// network unreachable, or ref has no git tag), trust the Ref
+			// difference and include the dep.  A partial resolution (one side
+			// resolved, the other did not) also falls through to include, since
+			// we cannot confirm they are the same commit.
+			if d.Sha != "" && c.Sha != "" && d.Sha == c.Sha {
+				logrus.Debugf("Dependency %s ref changed (%s -> %s) but SHAs match; skipping", d.Name, d.Ref, c.Ref)
+				continue
 			}
+			logrus.Debugf("Updated dependency: %q %s(%s) -> %s(%s)", d.Name, d.Ref, d.Sha, c.Ref, c.Sha)
+			// set the previous ref
+			c.Previous = d.Ref
+			updated = append(updated, c)
 		}
 	}
 	return updated, nil

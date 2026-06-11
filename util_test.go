@@ -16,7 +16,10 @@
 
 package main
 
-import "testing"
+import (
+	"sort"
+	"testing"
+)
 
 func TestParseModuleCommit(t *testing.T) {
 	for i, tc := range []struct {
@@ -66,6 +69,187 @@ func TestGetGitURL(t *testing.T) {
 
 	}
 
+}
+
+// mapCache is an in-memory Cache used in tests to pre-populate SHA values
+// without invoking git or making network calls.
+type mapCache map[string][]byte
+
+func (m mapCache) Get(key string) ([]byte, bool) {
+	v, ok := m[key]
+	return v, ok
+}
+
+func (m mapCache) Put(key string, value []byte) error {
+	m[key] = value
+	return nil
+}
+
+// shaKey builds the cache key that getSha uses for a given gitURL + rev,
+// matching the format in getSha: "git ls-remote <url> <rev> <rev>^{}"
+func shaKey(gitURL, rev string) string {
+	return "git ls-remote " + gitURL + " " + rev + " " + rev + "^{}"
+}
+
+func TestGetUpdatedDeps(t *testing.T) {
+	const (
+		shaA = "aaaaaaaaaaaa"
+		shaB = "bbbbbbbbbbbb"
+	)
+
+	// dep builds a dependency with a GitHub URL so getGitURL can resolve it
+	// without a network call.
+	dep := func(name, ref, sha string) dependency {
+		return dependency{
+			Name:   name,
+			Ref:    ref,
+			Sha:    sha,
+			GitURL: "https://github.com/example/" + name,
+		}
+	}
+
+	for _, tc := range []struct {
+		name     string
+		previous []dependency
+		current  []dependency
+		cache    mapCache
+		// want lists the dep names expected in the output, in any order.
+		want []string
+	}{
+		{
+			// Regression: semver bump where SHA lookup silently returns ""; dep
+			// must still appear in the output.
+			name: "semver bump - sha lookup yields empty (lookup failed)",
+			previous: []dependency{dep("crypto", "v0.49.0", "")},
+			current:  []dependency{dep("crypto", "v0.50.0", "")},
+			// Empty cache → getSha will call git ls-remote which will fail
+			// (no git remote in test environment) → errLookupFailed → should
+			// fall back to Ref comparison and INCLUDE the dep.
+			cache: mapCache{},
+			want:  []string{"crypto"},
+		},
+		{
+			// Regression: semver bump where SHA lookup succeeds with different
+			// SHAs (the normal happy path) — dep must appear.
+			name:     "semver bump - different shas",
+			previous: []dependency{dep("mylib", "v1.0.0", "")},
+			current:  []dependency{dep("mylib", "v1.1.0", "")},
+			cache: mapCache{
+				shaKey("https://github.com/example/mylib", "v1.0.0"): []byte(shaA),
+				shaKey("https://github.com/example/mylib", "v1.1.0"): []byte(shaB),
+			},
+			want: []string{"mylib"},
+		},
+		{
+			// A semver tag and its pseudo-version resolve to the SAME commit —
+			// dep should be suppressed (they're aliases).
+			name:     "semver alias - same sha, suppress",
+			previous: []dependency{dep("mylib", "v0.0.0-20210101000000-aaaaaaaaaaaa", shaA)},
+			current:  []dependency{dep("mylib", "v1.0.0", "")},
+			cache: mapCache{
+				shaKey("https://github.com/example/mylib", "v1.0.0"): []byte(shaA),
+			},
+			want: []string{},
+		},
+		{
+			// Two pseudo-version SHAs that differ — dep must appear.
+			name: "pseudo-version sha change",
+			previous: []dependency{dep("policy", "v0.0.0-20260324161837-b7c0b994300b", "b7c0b994300b")},
+			current:  []dependency{dep("policy", "v0.0.0-20260507153417-a39d60132186", "a39d60132186")},
+			cache:    mapCache{},
+			want:     []string{"policy"},
+		},
+		{
+			// Only the previous ref resolves to a SHA; current has no tag.
+			// Cannot confirm they're the same commit → include.
+			name:     "partial resolution - only previous sha resolved",
+			previous: []dependency{dep("mylib", "v1.0.0", "")},
+			current:  []dependency{dep("mylib", "v1.1.0", "")},
+			cache: mapCache{
+				shaKey("https://github.com/example/mylib", "v1.0.0"): []byte(shaA),
+				// v1.1.0 intentionally absent → getSha returns ("", nil)
+			},
+			want: []string{"mylib"},
+		},
+		{
+			// Only the current ref resolves to a SHA; previous has no tag.
+			// Cannot confirm they're the same commit → include.
+			name:     "partial resolution - only current sha resolved",
+			previous: []dependency{dep("mylib", "v1.0.0", "")},
+			current:  []dependency{dep("mylib", "v1.1.0", "")},
+			cache: mapCache{
+				// v1.0.0 intentionally absent → getSha returns ("", nil)
+				shaKey("https://github.com/example/mylib", "v1.1.0"): []byte(shaB),
+			},
+			want: []string{"mylib"},
+		},
+		{
+			// New dependency (not in previous) — must appear as New.
+			name:     "new dependency",
+			previous: []dependency{},
+			current:  []dependency{dep("newlib", "v1.0.0", "")},
+			cache:    mapCache{},
+			want:     []string{"newlib"},
+		},
+		{
+			// Dependency unchanged — must NOT appear.
+			name:     "unchanged dependency",
+			previous: []dependency{dep("stable", "v2.0.0", "")},
+			current:  []dependency{dep("stable", "v2.0.0", "")},
+			cache:    mapCache{},
+			want:     []string{},
+		},
+		{
+			// IgnoreDeps suppresses listed deps even when they changed.
+			name:     "ignore_deps suppresses changes",
+			previous: []dependency{dep("noisy", "v1.0.0", ""), dep("signal", "v1.0.0", "")},
+			current:  []dependency{dep("noisy", "v1.1.0", ""), dep("signal", "v1.1.0", "")},
+			cache:    mapCache{},
+			want:     []string{"signal"},
+		},
+		{
+			// OverrideDeps (Previous set on current dep) forces the comparison
+			// to use the overridden Previous value instead of the previous
+			// dep list.
+			name: "override_deps previous",
+			previous: []dependency{dep("overridden", "v1.0.0", "")},
+			current: []dependency{{
+				Name:     "overridden",
+				Ref:      "v2.0.0",
+				Previous: "v1.5.0", // override: treat v1.5.0 as the baseline
+				GitURL:   "https://github.com/example/overridden",
+			}},
+			cache: mapCache{},
+			want:  []string{"overridden"},
+		},
+	} {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			ignored := []string{}
+			if tc.name == "ignore_deps suppresses changes" {
+				ignored = []string{"noisy"}
+			}
+			got, err := getUpdatedDeps(tc.previous, tc.current, ignored, tc.cache)
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			gotNames := make([]string, 0, len(got))
+			for _, d := range got {
+				gotNames = append(gotNames, d.Name)
+			}
+			sort.Strings(gotNames)
+			wantSorted := append([]string{}, tc.want...)
+			sort.Strings(wantSorted)
+			if len(gotNames) != len(wantSorted) {
+				t.Fatalf("got deps %v, want %v", gotNames, wantSorted)
+			}
+			for i := range gotNames {
+				if gotNames[i] != wantSorted[i] {
+					t.Errorf("dep[%d]: got %q, want %q", i, gotNames[i], wantSorted[i])
+				}
+			}
+		})
+	}
 }
 
 func TestReleaseNote(t *testing.T) {
